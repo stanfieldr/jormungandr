@@ -2,28 +2,71 @@ use crate::{
     blockcfg::{Block, HeaderHash},
     start_up::{NodeStorage, NodeStorageConnection},
 };
+use async_trait::async_trait;
+use bb8::{ManageConnection, Pool, PooledConnection};
 use chain_storage::store::{for_path_to_nth_ancestor, BlockInfo, BlockStore};
 use std::sync::Arc;
 use tokio::prelude::future::Either;
 use tokio::prelude::*;
 use tokio::sync::lock::Lock;
+use tokio_02::{sync::Mutex, task::spawn_blocking};
+use tokio_compat::prelude::*;
 
 pub use chain_storage::error::Error as StorageError;
 
 #[derive(Clone)]
+struct ConnectionManager {
+    inner: Arc<NodeStorage>,
+}
+
+impl ConnectionManager {
+    pub fn new(storage: NodeStorage) -> Self {
+        Self {
+            inner: Arc::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl ManageConnection for ConnectionManager {
+    type Connection = NodeStorageConnection;
+    type Error = StorageError;
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let inner = self.inner.clone();
+        spawn_blocking(move || inner.connect())
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))
+            .and_then(std::convert::identity)
+    }
+
+    async fn is_valid(&self, conn: Self::Connection) -> Result<Self::Connection, Self::Error> {
+        spawn_blocking(move || conn.ping().and(Ok(conn)))
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))
+            .and_then(std::convert::identity)
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        conn.ping().is_ok()
+    }
+}
+
+#[derive(Clone)]
 pub struct Storage {
-    storage: Arc<NodeStorage>,
+    pool: Pool<ConnectionManager>,
 
     // All write operations must be performed only via this lock. The lock helps
     // us to ensure that all of the write operations are performed in the right
     // sequence. Otherwise they can be performed out of the expected order (for
     // example, by different tokio executors) which eventually leads to a panic
     // because the block data would be inconsistent at the time of a write.
-    write_connection_lock: Lock<NodeStorageConnection>,
+    write_connection_lock: Arc<Mutex<NodeStorageConnection>>,
 }
 
-pub struct BlockStream {
-    inner: NodeStorageConnection,
+pub struct BlockStream<'a> {
+    pool: Pool<ConnectionManager>,
+    inner: PooledConnection<'a, ConnectionManager>,
     state: BlockIterState,
 }
 
@@ -38,95 +81,93 @@ struct BlockIterState {
     pending_infos: Vec<BlockInfo<HeaderHash>>,
 }
 
+// async fn blocking_storage_op()
+
 impl Storage {
-    pub fn new(storage: NodeStorage) -> Self {
+    pub async fn new(storage: NodeStorage) -> Self {
+        let manager = ConnectionManager::new(storage);
+        let pool = Pool::builder().build(manager).await.unwrap();
+        let write_connection_lock =
+            Arc::new(Mutex::new(pool.dedicated_connection().await.unwrap()));
+
         Storage {
-            write_connection_lock: Lock::new(storage.connect().unwrap()),
-            storage: Arc::new(storage),
+            pool,
+            write_connection_lock,
         }
     }
 
-    pub fn get_tag(
-        &self,
-        tag: String,
-    ) -> impl Future<Item = Option<HeaderHash>, Error = StorageError> {
-        future::result(
-            self.storage
-                .connect::<Block>()
-                .and_then(|conn| conn.get_tag(&tag)),
-        )
+    async fn run<F, R>(&self, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(PooledConnection<'_, ConnectionManager>) -> Result<R, StorageError>
+            + Send
+            + 'static,
+        R: Send + 'static,
+    {
+        let connection = self
+            .pool
+            .clone()
+            .get()
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))?;
+
+        spawn_blocking(move || f(connection))
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))
+            .and_then(std::convert::identity)
     }
 
-    pub fn put_tag(
-        &self,
-        tag: String,
-        header_hash: HeaderHash,
-    ) -> impl Future<Item = (), Error = StorageError> {
-        let mut write_connection_lock = self.write_connection_lock.clone();
+    pub async fn get_tag(&self, tag: String) -> Result<Option<HeaderHash>, StorageError> {
+        self.run(|connection| connection.get_tag(&tag)).await
+    }
 
-        future::poll_fn(move || Ok(write_connection_lock.poll_lock())).and_then(move |mut guard| {
-            match guard.put_tag(&tag, &header_hash) {
-                Err(error) => future::err(error),
-                Ok(res) => future::ok(res),
-            }
+    pub async fn put_tag(&self, tag: String, header_hash: HeaderHash) -> Result<(), StorageError> {
+        let guard = self.write_connection_lock.clone().lock().await;
+        spawn_blocking(move || guard.put_tag(&tag, &header_hash))
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))
+            .and_then(std::convert::identity)
+    }
+
+    pub async fn get(&self, header_hash: HeaderHash) -> Result<Option<Block>, StorageError> {
+        self.run(|connection| match connection.get_block(&header_hash) {
+            Err(StorageError::BlockNotFound) => Ok(None),
+            Ok((block, _block_info)) => Ok(Some(block)),
+            Err(e) => Err(e),
         })
+        .await
     }
 
-    pub fn get(
+    pub async fn get_with_info(
         &self,
         header_hash: HeaderHash,
-    ) -> impl Future<Item = Option<Block>, Error = StorageError> {
-        match self
-            .storage
-            .connect()
-            .and_then(|conn| conn.get_block(&header_hash))
-        {
-            Err(StorageError::BlockNotFound) => future::ok(None),
-            Err(error) => future::err(error),
-            Ok((block, _block_info)) => future::ok(Some(block)),
-        }
-    }
-
-    pub fn get_with_info(
-        &self,
-        header_hash: HeaderHash,
-    ) -> impl Future<Item = Option<(Block, BlockInfo<HeaderHash>)>, Error = StorageError> {
-        match self
-            .storage
-            .connect()
-            .and_then(|conn| conn.get_block(&header_hash))
-        {
-            Err(StorageError::BlockNotFound) => future::ok(None),
-            Err(error) => future::err(error),
-            Ok(v) => future::ok(Some(v)),
-        }
-    }
-
-    pub fn block_exists(
-        &self,
-        header_hash: HeaderHash,
-    ) -> impl Future<Item = bool, Error = StorageError> {
-        match self
-            .storage
-            .connect::<Block>()
-            .and_then(|conn| conn.block_exists(&header_hash))
-        {
-            Err(StorageError::BlockNotFound) => future::ok(false),
-            Err(error) => future::err(error),
-            Ok(existence) => future::ok(existence),
-        }
-    }
-
-    pub fn put_block(&self, block: Block) -> impl Future<Item = (), Error = StorageError> {
-        let mut write_connection_lock = self.write_connection_lock.clone();
-
-        future::poll_fn(move || Ok(write_connection_lock.poll_lock())).and_then(move |mut guard| {
-            match guard.put_block(&block) {
-                Err(StorageError::BlockNotFound) => unreachable!(),
-                Err(error) => future::err(error),
-                Ok(()) => future::ok(()),
-            }
+    ) -> Result<Option<(Block, BlockInfo<HeaderHash>)>, StorageError> {
+        self.run(|connection| match connection.get_block(&header_hash) {
+            Err(StorageError::BlockNotFound) => Ok(None),
+            Ok(v) => Ok(Some(v)),
+            Err(e) => Err(e),
         })
+        .await
+    }
+
+    pub async fn block_exists(&self, header_hash: HeaderHash) -> Result<bool, StorageError> {
+        self.run(|connection| match connection.block_exists(&header_hash) {
+            Err(StorageError::BlockNotFound) => Ok(false),
+            Ok(r) => Ok(r),
+            Err(e) => Err(e),
+        })
+        .await
+    }
+
+    pub async fn put_block(&self, block: Block) -> Result<(), StorageError> {
+        let guard = self.write_connection_lock.clone().lock().await;
+        spawn_blocking(move || match guard.put_block(&block) {
+            Err(StorageError::BlockNotFound) => unreachable!(),
+            Err(e) => Err(e),
+            Ok(()) => Ok(()),
+        })
+        .await
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
+        .and_then(std::convert::identity)
     }
 
     /// Return values:
@@ -134,27 +175,33 @@ impl Storage {
     /// - `Err(CannotIterate)` - `from` is not ancestor of `to`
     /// - `Err(BlockNotFound)` - `from` or `to` was not found
     /// - `Err(_)` - some other storage error
-    pub fn stream_from_to(
+    pub async fn stream_from_to(
         &self,
         from: HeaderHash,
         to: HeaderHash,
-    ) -> impl Future<Item = BlockStream, Error = StorageError> {
-        let connection = match self.storage.connect() {
-            Ok(connection) => connection,
-            Err(error) => return future::err(error),
-        };
+    ) -> Result<BlockStream<'_>, StorageError> {
+        let pool = self.pool.clone();
 
-        match connection.is_ancestor(&from, &to) {
-            Err(error) => future::err(error),
-            Ok(None) => future::err(StorageError::CannotIterate),
+        let connection = pool
+            .get()
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)))?;
+
+        spawn_blocking(move || match connection.is_ancestor(&from, &to) {
             Ok(Some(distance)) => match connection.get_block_info(&to) {
-                Err(error) => future::err(error),
-                Ok(to_info) => future::ok(BlockStream {
+                Ok(to_info) => Ok(BlockStream {
+                    pool,
                     inner: connection,
                     state: BlockIterState::new(to_info, distance),
                 }),
+                Err(e) => Err(e),
             },
-        }
+            Ok(None) => Err(StorageError::CannotIterate),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
+        .and_then(std::convert::identity)
     }
 
     /// Stream a branch ending at `to` and starting from the ancestor
@@ -162,25 +209,44 @@ impl Storage {
     /// if `depth` is given as `None`.
     ///
     /// This function uses buffering in the sink to reduce lock contention.
-    pub fn send_branch<S, E>(
+    pub async fn send_branch<S, E>(
         &self,
         to: HeaderHash,
         depth: Option<u64>,
         sink: S,
-    ) -> impl Future<Item = (), Error = S::SinkError>
+    ) -> Result<(), S::SinkError>
     where
         S: Sink<SinkItem = Result<Block, E>>,
         E: From<StorageError>,
     {
-        let connection = self.storage.connect().unwrap();
+        let connection_res = self
+            .pool
+            .clone()
+            .get()
+            .await
+            .map_err(|e| StorageError::BackendError(Box::new(e)));
 
-        let res = connection.get_block_info(&to).map(|to_info| {
-            let depth = depth.unwrap_or(to_info.depth - 1);
-            BlockIterState::new(to_info, depth)
-        });
+        let res = match connection_res {
+            Ok(connection) => {
+                let iter_res = spawn_blocking(move || {
+                    connection.get_block_info(&to).map(|to_info| {
+                        let depth = depth.unwrap_or(to_info.depth - 1);
+                        BlockIterState::new(to_info, depth)
+                    })
+                })
+                .await
+                .map_err(|e| StorageError::BackendError(Box::new(e)))
+                .and_then(std::convert::identity);
+                match iter_res {
+                    Ok(iter) => Ok((iter, connection)),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         match res {
-            Ok(iter) => {
+            Ok((iter, connection)) => {
                 let mut state = SendState {
                     sink,
                     iter,
@@ -201,53 +267,53 @@ impl Storage {
                 Either::B(fut)
             }
         }
+        .compat()
+        .await
     }
 
-    pub fn find_closest_ancestor(
+    pub async fn find_closest_ancestor(
         &self,
         checkpoints: Vec<HeaderHash>,
         descendant: HeaderHash,
-    ) -> impl Future<Item = Option<Ancestor>, Error = StorageError> {
-        let connection = match self.storage.connect::<Block>() {
-            Ok(connection) => connection,
-            Err(error) => return future::err(error),
-        };
-
-        let mut ancestor = None;
-        let mut closest_found = std::u64::MAX;
-        for checkpoint in checkpoints {
-            // Checkpoints sent by a peer may not
-            // be present locally, so we need to ignore certain errors
-            match connection.is_ancestor(&checkpoint, &descendant) {
-                Ok(None) => {}
-                Ok(Some(distance)) => {
-                    if closest_found > distance {
-                        ancestor = Some(checkpoint);
-                        closest_found = distance;
-                    }
-                }
-                Err(e) => {
-                    // Checkpoints sent by a peer may not
-                    // be present locally, so we need to ignore certain errors
-                    match e {
-                        StorageError::BlockNotFound => {
-                            // FIXME: add block hash into the error so we
-                            // can see which of the two it is.
-                            // For now, just ignore either.
+    ) -> Result<Option<Ancestor>, StorageError> {
+        self.run(|connection| {
+            let mut ancestor = None;
+            let mut closest_found = std::u64::MAX;
+            for checkpoint in checkpoints {
+                // Checkpoints sent by a peer may not
+                // be present locally, so we need to ignore certain errors
+                match connection.is_ancestor(&checkpoint, &descendant) {
+                    Ok(None) => {}
+                    Ok(Some(distance)) => {
+                        if closest_found > distance {
+                            ancestor = Some(checkpoint);
+                            closest_found = distance;
                         }
-                        _ => return future::err(e),
+                    }
+                    Err(e) => {
+                        // Checkpoints sent by a peer may not
+                        // be present locally, so we need to ignore certain errors
+                        match e {
+                            StorageError::BlockNotFound => {
+                                // FIXME: add block hash into the error so we
+                                // can see which of the two it is.
+                                // For now, just ignore either.
+                            }
+                            _ => return Err(e),
+                        }
                     }
                 }
             }
-        }
-        future::ok(ancestor.map(|header_hash| Ancestor {
-            header_hash,
-            distance: closest_found,
-        }))
+            Ok(ancestor.map(|header_hash| Ancestor {
+                header_hash,
+                distance: closest_found,
+            }))
+        })
+        .await
     }
 }
 
-impl Stream for BlockStream {
+impl<'a> Stream for BlockStream<'a> {
     type Item = Block;
     type Error = StorageError;
 
