@@ -7,6 +7,8 @@ use crate::network::{
 };
 use linked_hash_map::LinkedHashMap;
 use std::net::SocketAddr;
+use std::net::IpAddr;
+use std::time::SystemTime;
 
 pub struct PeerMap {
     map: LinkedHashMap<Id, PeerData>,
@@ -19,6 +21,7 @@ struct PeerData {
     comms: PeerComms,
     stats: PeerStats,
     connecting: Option<ConnectHandle>,
+    error: bool,
 }
 
 pub enum CommStatus<'a> {
@@ -33,6 +36,7 @@ impl PeerData {
             comms,
             stats: PeerStats::default(),
             connecting: None,
+            error: false,
         }
     }
 
@@ -46,6 +50,7 @@ impl PeerData {
                 }
                 Err(_) => {
                     self.connecting = None;
+                    self.error = true;
                 }
             }
         }
@@ -97,9 +102,30 @@ impl PeerMap {
         let mut len = 0;
 
         for entry in self.map.entries() {
-            if let Some(_peer) = entry.get().stats.last_block_received() {
+            let ip_addr = entry.get().addr.as_ref().map(|socket| socket.ip());
+
+            if ip_addr.is_some() {
+                let is_private = match ip_addr.unwrap() {
+                    IpAddr::V4(ip4) => ip4.is_private(),
+                    IpAddr::V6(ip6) => false
+                };
+
+                if is_private {
+                    continue;
+                }
+            }
+
+            let time_since = match entry.get().stats.last_block_received() {
+                Some(t) => match SystemTime::now().duration_since(t) {
+                    Ok(n) => n.as_secs(),
+                    Err(_) => 42
+                },
+                None => 42
+            };
+
+            if time_since < 42 {
                 // TODO: check for more reasons to evict
-            } else {
+            } else if entry.get().connecting.is_none() {
                 let _peer = entry.remove();
                 len += 1;
             }
